@@ -1,0 +1,9 @@
+[package]
+name = "dachsb0t-features"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dachsb0t-plugin = { path = "../plugin" }
+
+async-trait = "0.1.52"

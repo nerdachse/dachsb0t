@@ -1,6 +1,7 @@
-use futures_util::{Future, SinkExt, StreamExt};
-use std::{env, time::Duration};
+use std::env;
+use std::error::Error;
 
+use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, tungstenite::Error as TError,
 };
@@ -17,10 +18,14 @@ use tokio::task;
 
 use std::sync::Arc;
 
-use crate::channels::websocket::{WebSocketRead, WebSocketWrite};
+use crate::channels::websocket::{WebSocketRead, WebSocketStream, WebSocketWrite};
 use crate::features::announce;
 
+use crate::channels::distributor::NerdHubRaumMsg;
 use crate::Plugins;
+
+use crate::channels::distributor::NERDHUBRAUM_WEBSOCKET_PATH;
+use dachsb0t_plugin::{Action, ChatMessage, Event};
 
 const TWITCH_CB_TOKEN: &'static str = "twitch_chat_bot_auth_token";
 const TWITCH_CHAT_URL: &'static str = "wss://irc-ws.chat.twitch.tv:443";
@@ -39,33 +44,97 @@ async fn connect_to_nerdhubraum() -> WebSocketStream<tokio_tungstenite::MaybeTls
 }
 */
 
+#[async_trait]
+pub trait TwitchChatSender {
+    async fn send_priv_msg(&mut self, msg: &str) -> Result<(), TError>;
+}
+
+#[async_trait]
+impl TwitchChatSender for WebSocketWrite {
+    async fn send_priv_msg(&mut self, msg: &str) -> Result<(), TError> {
+        self.send(Message::Text(format!("PRIVMSG #{TWITCH_CHANNEL} :{msg}")))
+            .await
+    }
+}
+
+pub struct TwitchChatBuilder {
+    ws_stream: WebSocketStream,
+}
+
+impl TwitchChatBuilder {
+    pub fn new(ws_stream: WebSocketStream) -> Self {
+        Self { ws_stream }
+    }
+
+    pub async fn auth(mut self, token: &str) -> Result<TwitchChat, Box<dyn Error>> {
+        self.ws_stream
+            .send(Message::Text(format!("PASS oauth:{token}")))
+            .await?;
+        self.ws_stream
+            .send(Message::Text(format!("NICK {TWITCH_BOT_NAME}")))
+            .await?;
+
+        Ok(TwitchChat::new(self.ws_stream))
+    }
+}
+
+pub struct TwitchChat {
+    read: WebSocketRead,
+    write: Arc<Mutex<WebSocketWrite>>,
+}
+
+impl TwitchChat {
+    fn new(ws_stream: WebSocketStream) -> Self {
+        let (write, read) = ws_stream.split();
+        Self {
+            read,
+            write: Arc::new(Mutex::new(write)),
+        }
+    }
+}
+
 pub async fn start(plugins: Plugins) -> () {
     let token = env::var(TWITCH_CB_TOKEN).expect("No twitch_chat_bot_auth_token provided in env");
     let url = Url::parse(TWITCH_CHAT_URL).expect("Couldn't parse TWITCH_CHAT_URL");
     let (ws_stream, _) = connect_async(url)
         .await
-        .expect("Failed to connect to TWITCH_CHAT_URL");
-    let (mut write, mut read) = ws_stream.split();
-    /*
+        .expect("Failed to connect to TWITCH_CHAT");
+
+    let twitch_chat = TwitchChatBuilder::new(ws_stream);
+    let mut twitch_chat = twitch_chat
+        .auth(&token)
+        .await
+        .expect("Failed to authenticate with twitch_chat");
+
+    // Nerdhubraum
     let (ws_stream, _) = connect_async(NERDHUBRAUM_WEBSOCKET_PATH)
         .await
-        .expect("Failed to connect to nerdhubraum");
-
-    let (mut nhr_write, _nhr_read) = ws_stream.split();
+        .expect("Failed to connect to NERDHUBRAUM");
+    let (nhr_write, _) = ws_stream.split();
     let nhr_write = Arc::new(Mutex::new(nhr_write));
-    */
 
-    // Only temporary join channel before
-    auth(&token, &mut write).await;
+    plugins.0.iter().for_each(|plugin| {
+        if let Ok(plugin) = plugin.inner.try_lock() {
+            info!("attempting to register plugin: {}", plugin.name());
+            match plugin.register_action() {
+                dachsb0t_plugin::RegisterAction::None => {
+                    info!("plugin: {} registered no action", plugin.name());
+                }
+                dachsb0t_plugin::RegisterAction::Interval(i) => match i.action {
+                    Action::Respond(msg) => {
+                        let _task =
+                            task::spawn(announce(i.interval, msg, twitch_chat.write.clone()));
+                    }
+                    Action::Broadcast(_) => todo!(),
+                },
+            }
+        }
+    });
 
-    let write = Arc::new(Mutex::new(write));
-    //let announce_discord = task::spawn(announce(Duration::from_secs(600), "Wusstest du schon, es gibt auch einen Discord?! Nein? Jetzt aber! https://discord.gg/Yf9MUJv3mr", write.clone()));
-    //let announce_github = task::spawn(announce(Duration::from_secs(1200), "Interesse an den Programmierstreams? Dann schau mal auf github vorbei: https://github.com/nerdachse", write.clone()));
     let handle_messages =
-        task::spawn(async move { handle_requests(&mut read, write, plugins).await });
-    //let _ = announce_discord.await;
-    //let _ = announce_github.await;
+        task::spawn(async move { handle_requests(&mut twitch_chat, nhr_write, plugins).await });
     let _ = handle_messages.await;
+    // Note that we never await the registered_actions
 }
 
 async fn handle_twitch_irc_command(code: &str, write: &mut WebSocketWrite) {
@@ -85,32 +154,23 @@ async fn handle_twitch_irc_command(code: &str, write: &mut WebSocketWrite) {
     }
 }
 
-#[async_trait]
-pub trait TwitchChatSender {
-    async fn send_priv_msg(&mut self, msg: &str) -> Result<(), TError>;
-}
-
-#[async_trait]
-impl TwitchChatSender for WebSocketWrite {
-    async fn send_priv_msg(&mut self, msg: &str) -> Result<(), TError> {
-        self.send(Message::Text(format!("PRIVMSG #{TWITCH_CHANNEL} :{msg}")))
-            .await
-    }
-}
-
-use dachsb0t_plugin::{Action, ChatMessage, Event};
-
-async fn handle_twitch_message(msg: &str, write: Arc<Mutex<WebSocketWrite>>, plugins: Plugins) {
+async fn handle_twitch_message(
+    msg: &str,
+    write: Arc<Mutex<WebSocketWrite>>,
+    nhr_write: Arc<Mutex<WebSocketWrite>>,
+    plugins: Plugins,
+) {
     let text = msg.split(":").last();
     let user_name = msg.split("display-name=").last();
     let user_name = user_name.unwrap_or("").split(";").next();
 
     plugins.0.into_iter().for_each(|plugin| {
         let cloned_write = write.clone();
+        let cloned_nhr_write = nhr_write.clone();
         let text = text.unwrap_or("").to_owned();
         let user_name = user_name.unwrap_or("").to_owned();
         tokio::spawn(async move {
-            if let Ok(mut plugin) = plugin.try_lock() {
+            if let Ok(mut plugin) = plugin.inner.try_lock() {
                 let action = plugin
                     .handle_event(Event::ChatMessage(ChatMessage {
                         user_name,
@@ -118,6 +178,11 @@ async fn handle_twitch_message(msg: &str, write: Arc<Mutex<WebSocketWrite>>, plu
                     }))
                     .await;
                 if let Some(action) = action {
+                    info!(
+                        "plugin: {} responded with action: {:?}",
+                        plugin.name(),
+                        action
+                    );
                     match action {
                         Action::Respond(msg) => {
                             if let Ok(mut write) = cloned_write.try_lock() {
@@ -126,36 +191,44 @@ async fn handle_twitch_message(msg: &str, write: Arc<Mutex<WebSocketWrite>>, plu
                                 }
                             }
                         }
-                        Action::Broadcast(_) => todo!(),
+                        Action::Broadcast(msg) => {
+                            if let Ok(mut write) = cloned_nhr_write.try_lock() {
+                                let msg = NerdHubRaumMsg::new(msg.r#type, msg.url);
+                                match serde_json::to_string(&msg) {
+                                    Ok(msg) => {
+                                        let msg = Message::Text(msg);
+                                        if let Err(e) = write.send(msg).await {
+                                            error!("Error sending message to nerdhubraum: {e}");
+                                        }
+                                    }
+                                    Err(e) => error!("Error sending message to nerdhubraum: {e}"),
+                                }
+                            }
+                        }
                     }
                 }
             }
         });
-    });
-}
-
-async fn auth(token: &str, write: &mut WebSocketWrite) {
-    write
-        .send(Message::Text(format!("PASS oauth:{token}")))
-        .await
-        .expect("Failed to send oauth token");
-    write
-        .send(Message::Text(format!("NICK {TWITCH_BOT_NAME}")))
-        .await
-        .expect("Failed to send nick");
+    })
 }
 
 async fn handle_requests(
-    read: &mut WebSocketRead,
-    write: Arc<Mutex<WebSocketWrite>>,
+    chat: &mut TwitchChat,
+    nhr_write: Arc<Mutex<WebSocketWrite>>,
     plugins: Plugins,
 ) -> () {
-    while let Some(msg) = read.next().await {
+    while let Some(msg) = chat.read.next().await {
         match msg {
             Ok(msg) => {
                 if msg.is_text() {
                     if let Ok(text) = msg.into_text() {
-                        handle_text_msg(text, write.clone(), plugins.clone()).await;
+                        handle_text_msg(
+                            text,
+                            chat.write.clone(),
+                            nhr_write.clone(),
+                            plugins.clone(),
+                        )
+                        .await;
                     }
                 } else if msg.is_ping() {
                     info!("I got a websocket ping, OMG!");
@@ -168,7 +241,12 @@ async fn handle_requests(
     }
 }
 
-async fn handle_text_msg(text: String, write: Arc<Mutex<WebSocketWrite>>, plugins: Plugins) {
+async fn handle_text_msg(
+    text: String,
+    write: Arc<Mutex<WebSocketWrite>>,
+    nhr_write: Arc<Mutex<WebSocketWrite>>,
+    plugins: Plugins,
+) {
     // One websocket message can incorporate multiple lines, but IRC is a
     // line-based protocol
     let mut lines = text.lines();
@@ -191,7 +269,8 @@ async fn handle_text_msg(text: String, write: Arc<Mutex<WebSocketWrite>>, plugin
             // additional capabilities
             Some('@') => {
                 info!("msg was {text}");
-                handle_twitch_message(text, write.clone(), plugins.clone()).await;
+                handle_twitch_message(text, write.clone(), nhr_write.clone(), plugins.clone())
+                    .await;
             }
             _other => warn!("Unhandled msg: {:?}", text),
         }
